@@ -37,8 +37,7 @@
 -define(AUTH_PREFERENCE, [
 		"CRAM-MD5",
 		"LOGIN",
-		"PLAIN",
-		"XOAUTH2"
+		"PLAIN"
 	]).
 
 -define(TIMEOUT, 1200000).
@@ -47,15 +46,12 @@
 -include_lib("eunit/include/eunit.hrl").
 -compile(export_all).
 -else.
--export([send/2, send/3, send_blocking/2, open/1, deliver/2, close/1]).
+-export([send/2, send/3, send_blocking/2]).
 -endif.
-
--opaque smtp_client_socket() :: {socket:socket(), list(), list()}.
--export_type([smtp_client_socket/0]).
 
 -type email() :: {string() | binary(), [string() | binary(), ...], string() | binary() | function()}.
 
--spec send(Email :: email(), Options :: list()) -> {'ok', pid()} | {'error', any()}.
+-spec send(Email :: {string() | binary(), [string() | binary(), ...], string() | binary() | function()}, Options :: list()) -> {'ok', pid()} | {'error', any()}.
 %% @doc Send an email in a non-blocking fashion via a spawned_linked process.
 %% The process will exit abnormally on a send failure.
 send(Email, Options) ->
@@ -64,7 +60,7 @@ send(Email, Options) ->
 %% @doc Send an email nonblocking and invoke a callback with the result of the send.
 %% The callback will receive either `{ok, Receipt}' where Receipt is the SMTP server's receipt
 %% identifier,  `{error, Type, Message}' or `{exit, ExitReason}', as the single argument.
--spec send(Email :: email(), Options :: list(), Callback :: function() | 'undefined') -> {'ok', pid()} | {'error', any()}.
+-spec send(Email :: {string() | binary(), [string() | binary(), ...], string() | binary() | function()}, Options :: list(), Callback :: function() | 'undefined') -> {'ok', pid()} | {'error', any()}.
 send(Email, Options, Callback) ->
 	NewOptions = lists:ukeymerge(1, lists:sort(Options),
 		lists:sort(?DEFAULT_OPTIONS)),
@@ -87,16 +83,12 @@ send(Email, Options, Callback) ->
 						end
 				end);
 		ok ->
-			Pid = spawn_link(fun () ->
-						send_it_nonblock(Email, NewOptions, Callback)
-				end
-			),
-			{ok, Pid};
+			send_it_nonblock(Email, NewOptions, Callback);
 		{error, Reason} ->
 			{error, Reason}
 	end.
 
--spec send_blocking(Email :: email(), Options :: list()) -> binary() | {'error', atom(), any()} | {'error', any()}.
+-spec send_blocking(Email :: {string() | binary(), [string() | binary(), ...], string() | binary() | function()}, Options :: list()) -> binary() | {'error', atom(), any()} | {'error', any()}.
 %% @doc Send an email and block waiting for the reply. Returns either a binary that contains
 %% the SMTP server's receipt or `{error, Type, Message}' or `{error, Reason}'.
 send_blocking(Email, Options) ->
@@ -116,7 +108,7 @@ send_it_nonblock(Email, Options, Callback) ->
 			Callback({error, Type, Message}),
 			{error, Type, Message};
 		{error, Type, Message} ->
-			erlang:exit({error, Type, Message});
+			{error, Type, Message};
 		Receipt when is_function(Callback) ->
 			Callback({ok, Receipt}),
 			{ok, Receipt};
@@ -124,53 +116,7 @@ send_it_nonblock(Email, Options, Callback) ->
 			{ok, Receipt}
 	end.
 
--spec open(Options :: list()) -> {ok, SocketDescriptor :: smtp_client_socket()} | {error, any()}.
-%% @doc Open a SMTP client socket with the provided options
-%% Once the socket has been opened, you can use it with deliver/2.
-open(Options) ->
-	NewOptions = lists:ukeymerge(1, lists:sort(Options),
-															 lists:sort(?DEFAULT_OPTIONS)),
-	case check_options(NewOptions) of
-		ok ->
-			RelayDomain = proplists:get_value(relay, NewOptions),
-			MXRecords = case proplists:get_value(no_mx_lookups, NewOptions) of
-										true ->
-											[];
-										_ ->
-											smtp_util:mxlookup(RelayDomain)
-									end,
-			%io:format("MX records for ~s are ~p~n", [RelayDomain, MXRecords]),
-			Hosts = case MXRecords of
-								[] ->
-									[{0, RelayDomain}]; % maybe we're supposed to relay to a host directly
-								_ ->
-									MXRecords
-							end,
-			case try_smtp_sessions(Hosts, NewOptions, []) of
-				{error, _, _} = Error -> Error;
-				SocketDescriptor -> {ok, SocketDescriptor}
-			end;
-		{error, Reason} ->
-			{error, bad_option, Reason}
-	end.
-
--spec deliver(Socket :: smtp_client_socket(), Email :: email()) -> {'ok', Receipt :: binary()} | {error, any()}.
-%% @doc Deliver an email on an open smtp client socket.
-%% For use with a socket opened with open/1. The socket can be reused as long as the previous call to deliver/2 returned `{ok, Receipt}'.
-deliver({Socket, Extensions, Options}, Email) ->
-	try try_sending_it(Email, Socket, Extensions, Options) of
-		Receipt -> {ok, Receipt}
-	catch
-		throw:FailMsg ->
-			{error, FailMsg}
-	end.
-
--spec close(Socker:: smtp_client_socket()) -> ok.
-%% @doc Close an open smtp client socket opened with open/1.
-close({Socket, _Extensions, _Options}) ->
-	quit(Socket).
-
--spec send_it(Email :: email(), Options :: list()) -> binary() | {'error', any(), any()}.
+-spec send_it(Email :: {string() | binary(), [string() | binary(), ...], string() | binary() | function()}, Options :: list()) -> binary() | {'error', any(), any()}.
 send_it(Email, Options) ->
 	RelayDomain = to_string(proplists:get_value(relay, Options)),
 	MXRecords = case proplists:get_value(no_mx_lookups, Options) of
@@ -179,99 +125,95 @@ send_it(Email, Options) ->
 		_ ->
 			smtp_util:mxlookup(RelayDomain)
 	end,
-	trace(Options, "MX records for ~s are ~p~n", [RelayDomain, MXRecords]),
+	%io:format("MX records for ~s are ~p~n", [RelayDomain, MXRecords]),
 	Hosts = case MXRecords of
 		[] ->
 			[{0, RelayDomain}]; % maybe we're supposed to relay to a host directly
 		_ ->
 			MXRecords
 	end,
-	case try_smtp_sessions(Hosts, Options, []) of
-		{Socket, Extensions, Options} ->
-			Receipt = try_sending_it(Email, Socket, Extensions, Options),
-			quit(Socket),
-			Receipt;
-		{error, _, _} = Error ->
-			Error
-	end.
+	try_smtp_sessions(Hosts, Email, Options, []).
 
--spec try_smtp_sessions(Hosts :: [{non_neg_integer(), string()}, ...], Options :: list(), RetryList :: list()) -> smtp_client_socket() | {'error', any(), any()}.
-try_smtp_sessions([{_Distance, Host} | _Tail] = Hosts, Options, RetryList) ->
-	try open_smtp_session(Host, Options) of
+-spec try_smtp_sessions(Hosts :: [{non_neg_integer(), string()}, ...], Email :: email(), Options :: list(), RetryList :: list()) -> binary() | {'error', any(), any()}.
+try_smtp_sessions([{_Distance, Host} | _Tail] = Hosts, Email, Options, RetryList) ->
+	try do_smtp_session(Host, Email, Options) of
 		Res -> Res
 	catch
 		throw:FailMsg ->
-			handle_smtp_throw(FailMsg, Hosts, Options, RetryList)
+			handle_smtp_throw(FailMsg, Hosts, Email, Options, RetryList)
 	end.
 
-handle_smtp_throw({permanent_failure, Message}, [{_Distance, Host} | _Tail], _Options, _RetryList) ->
+handle_smtp_throw({permanent_failure, Message}, [{_Distance, Host} | _Tail], _Email, _Options, _RetryList) ->
 	% permanent failure means no retries, and don't even continue with other hosts
 	{error, no_more_hosts, {permanent_failure, Host, Message}};
-handle_smtp_throw({temporary_failure, tls_failed}, [{_Distance, Host} | _Tail] = Hosts, Options, RetryList) ->
+handle_smtp_throw({temporary_failure, tls_failed}, [{_Distance, Host} | _Tail] = Hosts, Email, Options, RetryList) ->
 	% Could not start the TLS handshake; if tls is optional then try without TLS
 	case proplists:get_value(tls, Options) of
 		if_available ->
 			NoTLSOptions = [{tls,never} | proplists:delete(tls, Options)],
-			try open_smtp_session(Host, NoTLSOptions) of
+			try do_smtp_session(Host, Email, NoTLSOptions) of
 				Res -> Res
 			catch
 				throw:FailMsg ->
-					handle_smtp_throw(FailMsg, Hosts, Options, RetryList)
+					handle_smtp_throw(FailMsg, Hosts, Email, Options, RetryList)
 			end;
 		_ ->
-			try_next_host({temporary_failure, tls_failed}, Hosts, Options, RetryList)
+			try_next_host({temporary_failure, tls_failed}, Hosts, Email, Options, RetryList)
 	end;
-handle_smtp_throw(FailMsg, Hosts, Options, RetryList) ->
-	try_next_host(FailMsg, Hosts, Options, RetryList).
+handle_smtp_throw(FailMsg, Hosts, Email, Options, RetryList) ->
+	try_next_host(FailMsg, Hosts, Email, Options, RetryList).
 
-try_next_host({FailureType, Message}, [{_Distance, Host} | _Tail] = Hosts, Options, RetryList) ->
+try_next_host({FailureType, Message}, [{_Distance, Host} | _Tail] = Hosts, Email, Options, RetryList) ->
 	Retries = proplists:get_value(retries, Options),
 	RetryCount = proplists:get_value(Host, RetryList),
-	case fetch_next_host(Retries, RetryCount, Hosts, RetryList, Options) of
+	case fetch_next_host(Retries, RetryCount, Hosts, RetryList) of
 		{[], _NewRetryList} ->
 			{error, retries_exceeded, {FailureType, Host, Message}};
 		{NewHosts, NewRetryList} ->
-			try_smtp_sessions(NewHosts, Options, NewRetryList)
+			try_smtp_sessions(NewHosts, Email, Options, NewRetryList)
 	end.
 
-fetch_next_host(Retries, RetryCount, [{_Distance, Host} | Tail], RetryList, Options) when is_integer(RetryCount), RetryCount >= Retries ->
+fetch_next_host(Retries, RetryCount, [{_Distance, Host} | Tail], RetryList) when is_integer(RetryCount), RetryCount >= Retries ->
 	% out of chances
-	trace(Options, "retries for ~s exceeded (~p of ~p)~n", [Host, RetryCount, Retries]),
+	%io:format("retries for ~s exceeded (~p of ~p)~n", [Host, RetryCount, Retries]),
 	{Tail, lists:keydelete(Host, 1, RetryList)};
-fetch_next_host(Retries, RetryCount, [{Distance, Host} | Tail], RetryList, Options) when is_integer(RetryCount) ->
-	trace(Options, "scheduling ~s for retry (~p of ~p)~n", [Host, RetryCount, Retries]),
+fetch_next_host(_Retries, RetryCount, [{Distance, Host} | Tail], RetryList) when is_integer(RetryCount) ->
+	%io:format("scheduling ~s for retry (~p of ~p)~n", [Host, RetryCount, Retries]),
 	{Tail ++ [{Distance, Host}], lists:keydelete(Host, 1, RetryList) ++ [{Host, RetryCount + 1}]};
-fetch_next_host(0, _RetryCount, [{_Distance, Host} | Tail], RetryList, _Options) ->
+fetch_next_host(0, _RetryCount, [{_Distance, Host} | Tail], RetryList) ->
 	% done retrying completely
 	{Tail, lists:keydelete(Host, 1, RetryList)};
-fetch_next_host(Retries, _RetryCount, [{Distance, Host} | Tail], RetryList, Options) ->
+fetch_next_host(_Retries, _RetryCount, [{Distance, Host} | Tail], RetryList) ->
 	% otherwise...
-	trace(Options, "scheduling ~s for retry (~p of ~p)~n", [Host, 1, Retries]),
+	%io:format("scheduling ~s for retry (~p of ~p)~n", [Host, 1, Retries]),
 	{Tail ++ [{Distance, Host}], lists:keydelete(Host, 1, RetryList) ++ [{Host, 1}]}.
 
 
--spec open_smtp_session(Host :: string(), Options :: list()) -> smtp_client_socket().
-open_smtp_session(Host, Options) ->
-	{ok, Socket, _Host2, Banner} = connect(Host, Options),
-	trace(Options, "connected to ~s; banner was ~s~n", [Host, Banner]),
+-spec do_smtp_session(Host :: string(), Email :: email(), Options :: list()) -> binary().
+do_smtp_session(Host, Email, Options) ->
+	{ok, Socket, _Host, _Banner} = connect(Host, Options),
+	%io:format("connected to ~s; banner was ~s~n", [Host, Banner]),
 	{ok, Extensions} = try_EHLO(Socket, Options),
-	trace(Options, "Extensions are ~p~n", [Extensions]),
+	%io:format("Extensions are ~p~n", [Extensions]),
 	{Socket2, Extensions2} = try_STARTTLS(Socket, Options, Extensions),
-	trace(Options, "Extensions are ~p~n", [Extensions2]),
-	Authed = try_AUTH(Socket2, Options, proplists:get_value(<<"AUTH">>, Extensions2)),
-	trace(Options, "Authentication status is ~p~n", [Authed]),
-	{Socket2, Extensions, Options}.
+	%io:format("Extensions are ~p~n", [Extensions2]),
+	_Authed = try_AUTH(Socket2, Options, proplists:get_value(<<"AUTH">>, Extensions2)),
+	%io:format("Authentication status is ~p~n", [Authed]),
+	Receipt = try_sending_it(Email, Socket2, Extensions2),
+	%io:format("Mail sending successful~n"),
+	quit(Socket2),
+	Receipt.
 
--spec try_sending_it(Email :: email(), Socket :: socket:socket(), Extensions :: list(), Options :: list()) -> binary().
-try_sending_it({From, To, Body}, Socket, Extensions, Options) ->
-	try_MAIL_FROM(From, Socket, Extensions, Options),
-	try_RCPT_TO(To, Socket, Extensions, Options),
-	try_DATA(Body, Socket, Extensions, Options).
+-spec try_sending_it(Email :: email(), Socket :: socket:socket(), Extensions :: list()) -> binary().
+try_sending_it({From, To, Body}, Socket, Extensions) ->
+	try_MAIL_FROM(From, Socket, Extensions),
+	try_RCPT_TO(To, Socket, Extensions),
+	try_DATA(Body, Socket, Extensions).
 
--spec try_MAIL_FROM(From :: string() | binary(), Socket :: socket:socket(), Extensions :: list(), Options :: list()) -> true.
-try_MAIL_FROM(From, Socket, Extensions, Options) when is_binary(From) ->
-	try_MAIL_FROM(binary_to_list(From), Socket, Extensions, Options);
-try_MAIL_FROM("<" ++ _ = From, Socket, _Extensions, Options) ->
+-spec try_MAIL_FROM(From :: string() | binary(), Socket :: socket:socket(), Extensions :: list()) -> true.
+try_MAIL_FROM(From, Socket, Extensions) when is_binary(From) ->
+	try_MAIL_FROM(binary_to_list(From), Socket, Extensions);
+try_MAIL_FROM("<" ++ _ = From, Socket, _Extensions) ->
 	% TODO do we need to bother with SIZE?
 	socket:send(Socket, ["MAIL FROM: ", From, "\r\n"]),
 	case read_possible_multiline_reply(Socket) of
@@ -281,26 +223,26 @@ try_MAIL_FROM("<" ++ _ = From, Socket, _Extensions, Options) ->
 			quit(Socket),
 			throw({temporary_failure, Msg});
 		{ok, Msg} ->
-			trace(Options, "Mail FROM rejected: ~p~n", [Msg]),
+			%io:format("Mail FROM rejected: ~p~n", [Msg]),
 			quit(Socket),
 			throw({permanent_failure, Msg})
 	end;
-try_MAIL_FROM(From, Socket, Extension, Options) ->
+try_MAIL_FROM(From, Socket, Extensions) ->
 	% someone was bad and didn't put in the angle brackets
-	try_MAIL_FROM("<"++From++">", Socket, Extension, Options).
+	try_MAIL_FROM("<"++From++">", Socket, Extensions).
 
--spec try_RCPT_TO(Tos :: [binary() | string()], Socket :: socket:socket(), Extensions :: list(), Options :: list()) -> true.
-try_RCPT_TO([], _Socket, _Extensions, _Options) ->
+-spec try_RCPT_TO(Tos :: [binary() | string()], Socket :: socket:socket(), Extensions :: list()) -> true.
+try_RCPT_TO([], _Socket, _Extensions) ->
 	true;
-try_RCPT_TO([To | Tail], Socket, Extensions, Options) when is_binary(To) ->
-	try_RCPT_TO([binary_to_list(To) | Tail], Socket, Extensions, Options);
-try_RCPT_TO(["<" ++ _ = To | Tail], Socket, Extensions, Options) ->
+try_RCPT_TO([To | Tail], Socket, Extensions) when is_binary(To) ->
+	try_RCPT_TO([binary_to_list(To) | Tail], Socket, Extensions);
+try_RCPT_TO(["<" ++ _ = To | Tail], Socket, Extensions) ->
 	socket:send(Socket, ["RCPT TO: ",To,"\r\n"]),
 	case read_possible_multiline_reply(Socket) of
 		{ok, <<"250", _Rest/binary>>} ->
-			try_RCPT_TO(Tail, Socket, Extensions, Options);
+			try_RCPT_TO(Tail, Socket, Extensions);
 		{ok, <<"251", _Rest/binary>>} ->
-			try_RCPT_TO(Tail, Socket, Extensions, Options);
+			try_RCPT_TO(Tail, Socket, Extensions);
 		{ok, <<"4", _Rest/binary>> = Msg} ->
 			quit(Socket),
 			throw({temporary_failure, Msg});
@@ -308,14 +250,14 @@ try_RCPT_TO(["<" ++ _ = To | Tail], Socket, Extensions, Options) ->
 			quit(Socket),
 			throw({permanent_failure, Msg})
 	end;
-try_RCPT_TO([To | Tail], Socket, Extensions, Options) ->
+try_RCPT_TO([To | Tail], Socket, Extensions) ->
 	% someone was bad and didn't put in the angle brackets
-	try_RCPT_TO(["<"++To++">" | Tail], Socket, Extensions, Options).
+	try_RCPT_TO(["<"++To++">" | Tail], Socket, Extensions).
 
--spec try_DATA(Body :: binary() | function(), Socket :: socket:socket(), Extensions :: list(), Options :: list()) -> binary().
-try_DATA(Body, Socket, Extensions, Options) when is_function(Body) ->
-	try_DATA(Body(), Socket, Extensions, Options);
-try_DATA(Body, Socket, _Extensions, _Options) ->
+-spec try_DATA(Body :: binary() | function(), Socket :: socket:socket(), Extensions :: list()) -> binary().
+try_DATA(Body, Socket, Extensions) when is_function(Body) ->
+    try_DATA(Body(), Socket, Extensions);
+try_DATA(Body, Socket, _Extensions) ->
 	socket:send(Socket, "DATA\r\n"),
 	case read_possible_multiline_reply(Socket) of
 		{ok, <<"354", _Rest/binary>>} ->
@@ -371,11 +313,11 @@ try_AUTH(Socket, Options, AuthTypes) ->
 			end;
 		true ->
 
-			Username = to_binary(proplists:get_value(username, Options)),
-			Password = to_binary(proplists:get_value(password, Options)),
-			trace(Options, "Auth types: ~p~n", [AuthTypes]),
+			Username = to_string(proplists:get_value(username, Options)),
+			Password = to_string(proplists:get_value(password, Options)),
+			%io:format("Auth types: ~p~n", [AuthTypes]),
 			Types = re:split(AuthTypes, " ", [{return, list}, trim]),
-			case do_AUTH(Socket, Username, Password, Types, Options) of
+			case do_AUTH(Socket, Username, Password, Types) of
 				false ->
 					case proplists:get_value(auth, Options) of
 						always ->
@@ -392,95 +334,85 @@ try_AUTH(Socket, Options, AuthTypes) ->
 to_string(String) when is_list(String)   -> String;
 to_string(Binary) when is_binary(Binary) -> binary_to_list(Binary).
 
-to_binary(String) when is_binary(String)   -> String;
-to_binary(String) when is_list(String) -> list_to_binary(String).
-
--spec do_AUTH(Socket :: socket:socket(), Username :: binary(), Password :: binary(), Types :: [string()], Options :: list()) -> boolean().
-do_AUTH(Socket, Username, Password, Types, Options) ->
+-spec do_AUTH(Socket :: socket:socket(), Username :: string(), Password :: string(), Types :: [string()]) -> boolean().
+do_AUTH(Socket, Username, Password, Types) ->
 	FixedTypes = [string:to_upper(X) || X <- Types],
-	trace(Options, "Fixed types: ~p~n", [FixedTypes]),
+	%io:format("Fixed types: ~p~n", [FixedTypes]),
 	AllowedTypes = [X  || X <- ?AUTH_PREFERENCE, lists:member(X, FixedTypes)],
-	trace(Options, "available authentication types, in order of preference: ~p~n", [AllowedTypes]),
-	do_AUTH_each(Socket, Username, Password, AllowedTypes, Options).
+	%io:format("available authentication types, in order of preference: ~p~n",
+	%	[AllowedTypes]),
+	do_AUTH_each(Socket, Username, Password, AllowedTypes).
 
--spec do_AUTH_each(Socket :: socket:socket(), Username :: binary(), Password :: binary(), AuthTypes :: [string()], Options :: list()) -> boolean().
-do_AUTH_each(_Socket, _Username, _Password, [], _Options) ->
+-spec do_AUTH_each(Socket :: socket:socket(), Username :: string() | binary(), Password :: string() | binary(), AuthTypes :: [string()]) -> boolean().
+do_AUTH_each(_Socket, _Username, _Password, []) ->
 	false;
-do_AUTH_each(Socket, Username, Password, ["CRAM-MD5" | Tail], Options) ->
+do_AUTH_each(Socket, Username, Password, ["CRAM-MD5" | Tail]) ->
 	socket:send(Socket, "AUTH CRAM-MD5\r\n"),
 	case read_possible_multiline_reply(Socket) of
 		{ok, <<"334 ", Rest/binary>>} ->
 			Seed64 = binstr:strip(binstr:strip(Rest, right, $\n), right, $\r),
-			Seed = base64:decode(Seed64),
+			Seed = base64:decode_to_string(Seed64),
 			Digest = smtp_util:compute_cram_digest(Password, Seed),
 			String = base64:encode(list_to_binary([Username, " ", Digest])),
 			socket:send(Socket, [String, "\r\n"]),
 			case read_possible_multiline_reply(Socket) of
 				{ok, <<"235", _Rest/binary>>} ->
-					trace(Options, "authentication accepted~n", []),
+					%io:format("authentication accepted~n"),
 					true;
-				{ok, Msg} ->
-					trace(Options, "authentication rejected: ~s~n", [Msg]),
-					do_AUTH_each(Socket, Username, Password, Tail, Options)
+				{ok, _Msg} ->
+					%io:format("authentication rejected: ~s~n", [Msg]),
+					do_AUTH_each(Socket, Username, Password, Tail)
 			end;
-		{ok, Something} ->
-			trace(Options, "got ~s~n", [Something]),
-			do_AUTH_each(Socket, Username, Password, Tail, Options)
+		{ok, _Something} ->
+			%io:format("got ~s~n", [Something]),
+			do_AUTH_each(Socket, Username, Password, Tail)
 	end;
-do_AUTH_each(Socket, Username, Password, ["XOAUTH2" | Tail], Options) ->
-	Str = base64:encode(list_to_binary(["user=", Username, 1, "auth=Bearer ", Password, 1, 1])),
-	socket:send(Socket, ["AUTH XOAUTH2 ", Str, "\r\n"]),
-	case read_possible_multiline_reply(Socket) of
-		{ok, <<"235", _Rest/binary>>} ->
-			true;
-		{ok, _Msg} ->
-			do_AUTH_each(Socket, Username, Password, Tail, Options)
-	end;
-do_AUTH_each(Socket, Username, Password, ["LOGIN" | Tail], Options) ->
+do_AUTH_each(Socket, Username, Password, ["LOGIN" | Tail]) ->
 	socket:send(Socket, "AUTH LOGIN\r\n"),
 	case read_possible_multiline_reply(Socket) of
 		%% base64 Username: or username:
 		{ok, Prompt} when Prompt == <<"334 VXNlcm5hbWU6\r\n">>; Prompt == <<"334 dXNlcm5hbWU6\r\n">> ->
-			trace(Options, "username prompt~n", []),
+			%io:format("username prompt~n"),
 			U = base64:encode(Username),
 			socket:send(Socket, [U,"\r\n"]),
 			case read_possible_multiline_reply(Socket) of
 				%% base64 Password: or password:
 				{ok, Prompt2} when Prompt2 == <<"334 UGFzc3dvcmQ6\r\n">>; Prompt2 == <<"334 cGFzc3dvcmQ6\r\n">> ->
-					trace(Options, "password prompt~n", []),
+					%io:format("password prompt~n"),
 					P = base64:encode(Password),
 					socket:send(Socket, [P,"\r\n"]),
 					case read_possible_multiline_reply(Socket) of
 						{ok, <<"235 ", _Rest/binary>>} ->
-							trace(Options, "authentication accepted~n", []),
+							%io:format("authentication accepted~n"),
 							true;
-						{ok, Msg} ->
-							trace(Options, "password rejected: ~s", [Msg]),
-							do_AUTH_each(Socket, Username, Password, Tail, Options)
+						{ok, _Msg} ->
+							%io:format("password rejected: ~s", [Msg]),
+							do_AUTH_each(Socket, Username, Password, Tail)
 					end;
-				{ok, Msg2} ->
-					trace(Options, "username rejected: ~s", [Msg2]),
-					do_AUTH_each(Socket, Username, Password, Tail, Options)
+				{ok, _Msg2} ->
+					%io:format("username rejected: ~s", [Msg2]),
+					do_AUTH_each(Socket, Username, Password, Tail)
 			end;
-		{ok, Something} ->
-			trace(Options, "got ~s~n", [Something]),
-			do_AUTH_each(Socket, Username, Password, Tail, Options)
+		{ok, _Something} ->
+			%io:format("got ~s~n", [Something]),
+			do_AUTH_each(Socket, Username, Password, Tail)
 	end;
-do_AUTH_each(Socket, Username, Password, ["PLAIN" | Tail], Options) ->
-	AuthString = base64:encode(<<0, Username/binary, 0, Password/binary>>),
+do_AUTH_each(Socket, Username, Password, ["PLAIN" | Tail]) ->
+	AuthString = base64:encode("\0"++Username++"\0"++Password),
 	socket:send(Socket, ["AUTH PLAIN ", AuthString, "\r\n"]),
 	case read_possible_multiline_reply(Socket) of
 		{ok, <<"235", _Rest/binary>>} ->
-			trace(Options, "authentication accepted~n", []),
+			%io:format("authentication accepted~n"),
 			true;
-		Else ->
+		_Else ->
 			% TODO do we need to bother trying the multi-step PLAIN?
-			trace(Options, "authentication rejected ~p~n", [Else]),
-			do_AUTH_each(Socket, Username, Password, Tail, Options)
+			%io:format("authentication rejected~n"),
+			%io:format("~p~n", [Else]),
+			do_AUTH_each(Socket, Username, Password, Tail)
 	end;
-do_AUTH_each(Socket, Username, Password, [Type | Tail], Options) ->
-	trace(Options, "unsupported AUTH type ~s~n", [Type]),
-	do_AUTH_each(Socket, Username, Password, Tail, Options).
+do_AUTH_each(Socket, Username, Password, [_Type | Tail]) ->
+	%io:format("unsupported AUTH type ~s~n", [Type]),
+	do_AUTH_each(Socket, Username, Password, Tail).
 
 -spec try_EHLO(Socket :: socket:socket(), Options :: list()) -> {ok, list()}.
 try_EHLO(Socket, Options) ->
@@ -493,7 +425,7 @@ try_EHLO(Socket, Options) ->
 			quit(Socket),
 			throw({temporary_failure, Msg});
 		{ok, Reply} ->
-			{ok, parse_extensions(Reply, Options)}
+			{ok, parse_extensions(Reply)}
 	end.
 
 -spec try_HELO(Socket :: socket:socket(), Options :: list()) -> {ok, list()}.
@@ -516,24 +448,23 @@ try_STARTTLS(Socket, Options, Extensions) ->
 	case {proplists:get_value(tls, Options),
 			proplists:get_value(<<"STARTTLS">>, Extensions)} of
 		{Atom, true} when Atom =:= always; Atom =:= if_available ->
-			trace(Options, "Starting TLS~n", []),
+			%io:format("Starting TLS~n"),
 			case {do_STARTTLS(Socket, Options), Atom} of
 				{false, always} ->
-					trace(Options, "TLS failed~n", []),
+					%io:format("TLS failed~n"),
 					quit(Socket),
 					erlang:throw({temporary_failure, tls_failed});
 				{false, if_available} ->
-					trace(Options, "TLS failed~n", []),
+					%io:format("TLS failed~n"),
 					{Socket, Extensions};
 				{{S, E}, _} ->
-					trace(Options, "TLS started~n", []),
+					%io:format("TLS started~n"),
 					{S, E}
 			end;
 		{always, _} ->
 			quit(Socket),
 			erlang:throw({missing_requirement, tls});
 		_ ->
-			trace(Options, "TLS not requested ~p~n", [Options]),
 			{Socket, Extensions}
 	end.
 
@@ -556,8 +487,8 @@ do_STARTTLS(Socket, Options) ->
 					quit(Socket),
 					error_logger:error_msg("SSL not started.~n"),
 					erlang:throw({permanent_failure, ssl_not_started});
-				Else ->
-					trace(Options, "~p~n", [Else]),
+				_Else ->
+					%io:format("~p~n", [Else]),
 					false
 			end;
 		{ok, <<"4", _Rest/binary>> = Msg} ->
@@ -576,7 +507,7 @@ connect(Host, Options) ->
 		undefined -> [];
 		Other -> Other
 	end,
-	SockOpts = [binary, {packet, line}, {keepalive, true}, {active, false} | AddSockOpts],
+    SockOpts = [binary, {packet, line}, {keepalive, true}, {active, false} | AddSockOpts],
 	Proto = case proplists:get_value(ssl, Options) of
 		true ->
 			ssl;
@@ -669,8 +600,8 @@ check_options(Options) ->
 			end
 	end.
 
--spec parse_extensions(Reply :: binary(), Options :: list()) -> [{binary(), binary()}].
-parse_extensions(Reply, Options) ->
+-spec parse_extensions(Reply :: binary()) -> [{binary(), binary()}].
+parse_extensions(Reply) ->
 	[_ | Reply2] = re:split(Reply, "\r\n", [{return, binary}, trim]),
 	[
 		begin
@@ -683,17 +614,11 @@ parse_extensions(Reply, Options) ->
 							0 ->
 								{binstr:to_upper(Body), true};
 							_ ->
-								trace(Options, "discarding option ~p~n", [Body]),
+								%io:format("discarding option ~p~n", [Body]),
 								[]
 						end
 				end
 		end  || Entry <- Reply2].
-
-trace(Options, Format, Args) ->
-	case proplists:get_value(trace_fun, Options) of
-		undefined -> ok;
-		F -> F(Format, Args)
-	end.
 
 -ifdef(TEST).
 
@@ -1146,7 +1071,7 @@ extension_parse_test_() ->
 	[
 		{"parse extensions",
 			fun() ->
-					Res = parse_extensions(<<"250-smtp.example.com\r\n250-PIPELINING\r\n250-SIZE 20971520\r\n250-VRFY\r\n250-ETRN\r\n250-STARTTLS\r\n250-AUTH CRAM-MD5 PLAIN DIGEST-MD5 LOGIN\r\n250-AUTH=CRAM-MD5 PLAIN DIGEST-MD5 LOGIN\r\n250-ENHANCEDSTATUSCODES\r\n250-8BITMIME\r\n250 DSN">>, []),
+					Res = parse_extensions(<<"250-smtp.example.com\r\n250-PIPELINING\r\n250-SIZE 20971520\r\n250-VRFY\r\n250-ETRN\r\n250-STARTTLS\r\n250-AUTH CRAM-MD5 PLAIN DIGEST-MD5 LOGIN\r\n250-AUTH=CRAM-MD5 PLAIN DIGEST-MD5 LOGIN\r\n250-ENHANCEDSTATUSCODES\r\n250-8BITMIME\r\n250 DSN">>),
 					?assertEqual(true, proplists:get_value(<<"PIPELINING">>, Res)),
 					?assertEqual(<<"20971520">>, proplists:get_value(<<"SIZE">>, Res)),
 					?assertEqual(true, proplists:get_value(<<"VRFY">>, Res)),
